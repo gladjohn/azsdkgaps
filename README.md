@@ -4,7 +4,7 @@ MSAL.NET supports certificate-bound client assertions and mTLS Proof-of-Possessi
 Federated Identity Credential (FIC) path does not use them: it reduces every assertion to a `string`, never
 requests mTLS-PoP, and so returns Bearer tokens only. This note records that gap.
 
-> Public sources only (MSAL.NET, `azure-sdk-for-net`, the PRs in §6). On current `main`, Azure.Identity's
+> Public sources only (MSAL.NET, `azure-sdk-for-net`, and the design PR in §6). On current `main`, Azure.Identity's
 > credentials live in **Azure.Core** (`sdk/core/Azure.Core/src/Identity/…`; `Azure.Identity` forwards the
 > types). Checked against source on 2026-07-12.
 
@@ -20,8 +20,7 @@ requests mTLS-PoP, and so returns Bearer tokens only. This note records that gap
   internal `ManagedIdentityAsFederatedIdentityCredential` all converge on a `string` assertion, never request
   PoP, and return Bearer tokens.
 - **The gap.** There is no way, through these credentials, to pass a binding certificate or ask for an
-  `mtls_pop` token. `AccessToken` can already carry a binding certificate, so the return side is mostly ready;
-  the request side is not.
+  `mtls_pop` token. `AccessToken` can represent a binding certificate, but the current FIC path never produces one.
 
 ---
 
@@ -48,7 +47,9 @@ looks at `IsProofOfPossessionEnabled`.
 | **SNI cert** | `WithCertificate(cert)` + `WithMtlsProofOfPossession()` → `mtls_pop` + `BindingCertificate` | ❌ `ClientCertificateCredential` never requests PoP |
 | **FIC cert-bound assertion** | `WithClientAssertion(Func<AssertionRequestOptions,CT,Task<ClientSignedAssertion>>)` with `TokenBindingCertificate` → `jwt-pop` (add `WithMtlsProofOfPossession()` for an `mtls_pop` result) | ❌ callback returns `string` only |
 | **MSI (IMDSv2)** | `AcquireTokenForManagedIdentity(res).WithMtlsProofOfPossession()` | ✅ direct MI (opt-in; host + KeyAttestation-gated); ❌ MI-as-FIC |
-| **MSI unattested (design)** | PR #6108 design: strongest key else in-memory RSA, no MAA, scope-in-CSR (OID TBD) → `mtls_pop` | n/a (IMDS/ESTS + MSAL) |
+
+An unattested managed-identity mTLS-PoP flow is described separately in PR #6108. It is a design and is not
+part of current Azure.Identity behavior.
 
 Two facts to keep straight:
 
@@ -57,8 +58,8 @@ Two facts to keep straight:
   one carrying a `TokenBindingCertificate` — can result in either a Bearer or an `mtls_pop` token; you get
   `mtls_pop` only if that leg also calls `WithMtlsProofOfPossession()`.
 - **Attestation and binding are separate in MSAL** (`WithMtlsProofOfPossession()` vs `WithAttestationSupport()`
-  in the KeyAttestation package), and the unattested flow above is a design, not shipping. Today Azure.Identity
-  only tries mTLS-PoP for managed identity when the KeyAttestation package is present, so it ties the two together.
+  in the KeyAttestation package). Today Azure.Identity only tries mTLS-PoP for managed identity when the
+  KeyAttestation package is present, so it ties the two together.
 
 Direct `ManagedIdentityCredential` can already get an `mtls_pop` token, but that is a separate flow and does
 not close the FIC gap.
@@ -71,7 +72,7 @@ not close the FIC gap.
 |---|---|---|
 | G1 | **No way to pass a certificate** | `MsalConfidentialClient` callbacks are `Func<string>` / `Func<CT,Task<string>>`, so there is nowhere to return a `BindingCertificate`. |
 | G2 | **The FIC path never asks for PoP** | `AcquireTokenForClientCoreAsync` never calls `WithMtlsProofOfPossession()`, and `ClientAssertionCredential` ignores `IsProofOfPossessionEnabled`. |
-| G3 | **One flag, no scheme** | `IsProofOfPossessionEnabled` is per request, not global, and carries SHR (Signed HTTP Request) fields — nonce, URI, method. The same flag means SHR PoP for broker, mTLS binding for MI, and nothing for FIC, so a caller can set it and still get Bearer from `ClientAssertionCredential`. |
+| G3 | **No way to identify the PoP scheme** | `IsProofOfPossessionEnabled` is per request, not global, but it does not distinguish SHR (Signed HTTP Request) from mTLS. The FIC path ignores it today. |
 | G4 | **The cert is never produced** | `AccessToken.BindingCertificate` exists and `ToAccessToken()` already copies `TokenType` and `BindingCertificate` — but the FIC path never produces a bound result to copy. |
 
 On G4: this covers the normal `TokenCredential` / `AccessToken` path. The newer `System.ClientModel`
@@ -89,25 +90,22 @@ surface this in the public API (for example, extending a credential, adding one,
 is a separate design decision, outside this note.
 
 `ManagedIdentityAsFederatedIdentityCredential` shows the gap concretely. Its callback is
-`async _ => (await mi.GetTokenAsync(ctx)).Token`, with no PoP on the inner call — so the managed-identity leg
-is Bearer and only `.Token` survives. Binding it would need a bound MI token first, the certificate carried
-through the assertion, and mTLS-PoP requested on the second leg. (The second leg must be a confidential client;
-managed identity has no `WithClientAssertion`.)
+`async _ => (await mi.GetTokenAsync(ctx)).Token`: the inner managed-identity request does not ask for PoP, so
+it returns a Bearer token; the callback keeps only `.Token`; the binding certificate is not preserved; and the
+second leg is therefore an ordinary, unbound FIC exchange. Binding it would need a bound MI token first, the
+certificate carried through the assertion, and mTLS-PoP requested on the second leg — which must be a
+confidential client, since managed identity has no `WithClientAssertion`.
 
-Closing the gap also depends on work outside the credential: MSAL uses its own `HttpClient` for the
-token-endpoint mTLS handshake (the Azure.Core pipeline does not carry mTLS credentials), the `mtls_pop` token
-must reach the target service over mTLS with the binding certificate, and the binding certificate has its own
-lifetime and owner. The unattested MSI flow (PR #6108) is a design and depends on IMDS/ESTS.
+The token exchange and the resource call must also use the binding certificate. Transport and certificate
+lifetime are separate implementation concerns.
 
 ---
 
 ## 6. References
 
-| Ref | What |
+| Source | Files |
 |---|---|
-| MSAL source | `ClientSignedAssertion`, `AssertionRequestOptions`, the `WithClientAssertion(...)` overloads, `AcquireTokenForClientParameterBuilder.WithMtlsProofOfPossession()`, `AuthenticationResult.BindingCertificate` — shipped `PublicAPI` (net8.0). |
-| MSAL `.github/skills/msal-mtls-pop-fic-two-leg/` | Worked two-leg FIC mTLS-PoP examples and helpers; MSAL 4.82.1+; KeyAttestation package for `WithAttestationSupport()`. |
-| MSAL PR #6108 | Design doc `msi_unattested_mtls_pop_design.md` — unattested MSI V2 mTLS-PoP (scope-in-CSR, no MAA); scope OID/encoding still open. |
-| MSAL PRs #6109 / #6110 / #6111 | Background docs: Azure.Identity credentials; FIC credentials today; the mTLS-PoP FIC gap. |
-| Azure SDK source | `Identity/Credentials/ClientAssertionCredential.cs`, `WorkloadIdentityCredential.cs`, `Identity/MsalConfidentialClient.cs`, `MsalManagedIdentityClient.cs`, `ManagedIdentityClient.cs`, `ChainedTokenCredentialFactory.cs`, `AuthenticationResultExtensions.cs`, `AccessToken.cs`, `TokenRequestContext.cs` (under `sdk/core/Azure.Core/src`). |
-| Azure SDK PR #60286 | Key Vault beta PoP token-binding: `ChallengeBasedAuthenticationPolicy` sets `IsProofOfPossessionEnabled=true` and adds `x-ms-tokenboundauth` (always-on preview; `TODO` to read it from the challenge). |
+| MSAL.NET (`src/client/Microsoft.Identity.Client`) | `AppConfig/ClientSignedAssertion.cs`, `AppConfig/AssertionRequestOptions.cs`, `AppConfig/ConfidentialClientApplicationBuilder.cs`, `ApiConfig/AcquireTokenForClientParameterBuilder.cs` |
+| MSAL.NET tests | `ClientCredentialsMtlsPopTests.cs`, `ManagedIdentityImdsV2Tests.cs` |
+| Azure SDK (`sdk/core/Azure.Core/src`) | `Identity/MsalConfidentialClient.cs`, `Identity/Credentials/ClientAssertionCredential.cs`, `Identity/Credentials/WorkloadIdentityCredential.cs`, `Identity/ChainedTokenCredentialFactory.cs`, `Identity/AuthenticationResultExtensions.cs`, `AccessToken.cs`, `TokenRequestContext.cs` |
+| Design reference | MSAL PR #6108 — unattested MSI V2 mTLS-PoP (`docs/msi_v2/msi_unattested_mtls_pop_design.md`); a design, not shipping behavior. |
